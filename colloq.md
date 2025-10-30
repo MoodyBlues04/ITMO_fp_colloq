@@ -1524,38 +1524,25 @@ bstr2 = "bar"
 ```
 ---
 
-# Lecture 7: Monad Transformers
+## Lecture 7: Monad Transformers
 
-## Monads as Effects
+### Monads as Effects
 
 **Монады как эффекты** — это подход, где каждая монада представляет определённый тип побочного эффекта:
 
-- **`Maybe`** — эффект возможного отсутствия значения
-- **`Either e`** — эффект ошибки с информацией
-- **`State s`** — эффект изменяемого состояния
-- **`Reader r`** — эффект чтения из окружения
-- **`Writer w`** — эффект записи лога
-- **`IO`** — эффект ввода-вывода
+| Monad | Effect |
+|-------|--------|
+| Maybe | Computation can fail (store 0 or 1 values). |
+| Either | Computation can fail with an annotated error. |
+| [] | Computation stores 0 or more values. |
+| Writer | Computation has a monoidal logging accumulator. |
+| Reader | Computation has access to some immutable environment. |
+| State | Computation is stateful. |
+| IO | Computation can perform I/O actions. |
 
-```haskell
--- Чистая функция
-pureAdd :: Int -> Int -> Int
-pureAdd x y = x + y
+При этом мы хотим иметь доступ сразу к нескольким эффектам. Нам понадобится их композиция.
 
--- Функция с эффектом Maybe (возможное отсутствие значения)
-safeDivide :: Int -> Int -> Maybe Int
-safeDivide _ 0 = Nothing
-safeDivide x y = Just (x `div` y)
-
--- Функция с эффектом State (изменяемое состояние)
-incrementCounter :: State Int Int
-incrementCounter = do
-    count <- get
-    put (count + 1)
-    return count
-```
-
-## Composing Monads
+### Composing Monads
 
 **Проблема композиции монад**: монады не композируются напрямую. Тип `m (n a)` не является монадой автоматически.
 
@@ -1568,51 +1555,102 @@ incrementCounter = do
 -- Решение: монадные трансформеры
 ```
 
-## MonadIO
+### MonadIO
 
-**`MonadIO`** — класс типов для поднятия `IO` действий в любую другую монаду, поддерживающую `IO`.
+**`MonadIO`** — объединение `Maybe` и `IO`.
 
 ```haskell
-class Monad m => MonadIO m where
-    liftIO :: IO a -> m a
+newtype MaybeIO a = MaybeIO { runMaybeIO :: IO (Maybe a) }
 
--- Примеры использования
-readFileIO :: MonadIO m => FilePath -> m String
-readFileIO path = liftIO (readFile path)
+instance Monad MaybeIO where
+    return x = MaybeIO (return (Just x))
+    MaybeIO action >>= f = MaybeIO $ do
+        result <- action
+        case result of
+            Nothing -> return Nothing
+            Just x  -> runMaybeIO (f x)
 
-printIO :: (MonadIO m, Show a) => a -> m ()
-printIO x = liftIO (print x)
+-- usage:
+result <- runMaybeIO $ do
+    c1 <- MaybeIO $ tryConnect "host1" -- now we do not need to write `case` with Maybe check on each `tryConnect`
+    c2 <- MaybeIO $ tryConnect "host2"
 
--- Использование в стеке трансформеров
-example :: ReaderT Config IO ()
-example = do
-    config <- ask
-    content <- liftIO $ readFile (configFile config)  -- Поднимаем IO в ReaderT Config IO
-    liftIO $ putStrLn content
+-- but we cant lift IO context to MaybeIO context automatically:
+result <- runMaybeIO $ do
+    c1 <- MaybeIO $ tryConnect "host1"
+    print "Hello" -- typechecking fails, but what if we REALLY want to do this?
+    c2 <- MaybeIO $ tryConnect "host2"
 ```
 
-## MonadTrans Type Class
+**Lifting:**
+```haskell
+liftIOToMaybeIO :: IO a -> MaybeIO a
+liftIOToMaybeIO action = MaybeIO $ Just <$> action
+
+-- now we can write:
+result <- runMaybeIO $ do
+  c1 <- MaybeIO $ tryConnect "host1"
+  liftIOToMaybeIO $ print "Hello"
+  c2 <- MaybeIO $ tryConnect "host2"
+```
+
+### MonadTrans Type Class
 
 **`MonadTrans`** — базовый класс для всех монадных трансформеров.
 
 ```haskell
-class MonadTrans t where
+class MonadTrans t where   -- t :: (Type -> Type) -> Type -> Type
+                           -- all monad transformers have exactly this type
+                           -- all monad transformers instantiate MonadTrans
     lift :: Monad m => m a -> t m a
 
 -- Законы:
--- 1. lift . return = return
--- 2. lift (m >>= f) = lift m >>= (lift . f)
+-- 1. lift . return  ≡ return
+-- 2. lift (m >>= f) ≡ lift m >>= (lift . f)
+-- 3. lift . join = join . lift . fmap lift   -- redundant, but still valid
 ```
 
-## MaybeT Transformer
+### MaybeT Transformer
 
 **`MaybeT`** — трансформер, добавляющий эффект возможного неуспеха.
 
-```haskell
-newtype MaybeT m a = MaybeT { runMaybeT :: m (Maybe a) }
+Но хочется не писать каждый раз с нуля `Maybe<Monad name>`, хочется иметь 1 трансформер для комбинирования `Maybe` с другими монадами. Это и есть `MaybeT`:
 
+```haskell
+type MaybeIO = MaybeT IO
+
+-- `MaybeT m a` представляет вычисление типа `m (Maybe a)`
+-- m - внутренняя монада
+-- a - выражение
+newtype MaybeT m a = MaybeT 
+    { runMaybeT :: m (Maybe a) }
+
+-- instance of MonadTrans:
 instance MonadTrans MaybeT where
-    lift m = MaybeT (fmap Just m)
+    lift :: Monad m => m a -> MaybeT m a
+    lift = liftToMaybeT
+
+-- implementation
+instance Monad m => Monad (MaybeT m) where
+    return :: a -> MaybeT m a
+    return x = MaybeT (return (Just x)) -- `return (Just x)` - поднимает `(Maybe x)` в контекст внутренней монады `m`
+
+    -- стандартная реализация для монад
+    -- достает `a` из контекста монады и применяет к нему маппер `(a -> MaybeT m b)`
+    (>>=) :: MaybeT m a -> (a -> MaybeT m b) -> MaybeT m b
+    MaybeT action >>= f = MaybeT $ do
+        result <- action -- извлекаем результат из контекста `m`
+                         -- result :: Maybe a
+        case result of
+            Nothing -> return Nothing
+            Just x  -> runMaybeT (f x) -- mapping + wrap back into `m` context
+
+-- lift implementation
+liftToMaybeT :: Functor m => m a -> MaybeT m a
+liftToMaybeT = MaybeT . fmap Just
+```
+
+```haskell
 
 -- Пример: комбинация Maybe и IO
 readConfigFile :: MaybeT IO String
@@ -1622,34 +1660,66 @@ readConfigFile = do
         then MaybeT (return Nothing)  -- Неуспех
         else return content           -- Успех
 
--- Запуск: runMaybeT readConfigFile :: IO (Maybe String)
+-- Запуск:
+runMaybeT readConfigFile :: IO (Maybe String)
 ```
 
-## ReaderT Transformer
+### ReaderT Transformer
 
 **`ReaderT`** — самый популярный трансформер, добавляющий эффект read-only окружения.
 
 ```haskell
 newtype ReaderT r m a = ReaderT { runReaderT :: r -> m a }
 
+type Reader r = ReaderT r Identity
+type LoggerIO = ReaderT LoggerName IO
+
 instance MonadTrans (ReaderT r) where
-    lift m = ReaderT (\_ -> m)
+    lift :: m a -> ReaderT r m a
+    lift = ReaderT . const
+ -- lift ma = ReaderT $ \_ -> ma
 
--- Пример использования
-type Config = (String, Int)
-
-getDatabaseConnection :: ReaderT Config IO String
-getDatabaseConnection = do
-    (host, port) <- ask
-    liftIO $ putStrLn $ "Connecting to " ++ host ++ ":" ++ show port
-    return "connection-handle"
-
--- Запуск: runReaderT getDatabaseConnection ("localhost", 5432) :: IO String
+instance Monad m => Monad (ReaderT r m) where
+    return  = lift . return
+    m >>= f = ReaderT $ \r -> do
+        a <- runReaderT m r
+        runReaderT (f a) r
 ```
 
-## Comparison of Transformers and Old Types
+##### Usage
+```haskell
+type LoggerIO = ReaderT LoggerName IO
 
-### Старый подход (конкретные монады)
+logMessage :: Text -> LoggerIO ()
+
+writeFileWithLog :: FilePath -> Text -> LoggerIO ()
+writeFileWithLog path content = do
+    logMessage $ "Writing to file: " <> T.pack (show path)
+    lift $ writeFile path content
+
+prettifyFileContent :: FilePath -> LoggerIO ()
+prettifyFileContent path = do
+    content <- readFileWithLog path
+    writeFileWithLog path (format content)
+
+main :: IO ()
+main = runReaderT (prettifyFileContent "foo.txt") (LoggerName "Application") 
+```
+
+### Monad Transformers list
+| Precursor | Transformer | Original Type | Combined Type |
+|-----------|-------------|---------------|---------------|
+| Maybe | MaybeT | `Maybe a` | `m (Maybe a)` |
+| Either | ExceptT | `Either a b` | `m (Either a b)` |
+| Writer | WriterT | `(a, w)` | `m (a, w)` |
+| Reader | ReaderT | `r -> a` | `r -> m a` |
+| State | StateT | `s -> (a, s)` | `s -> m (a, s)` |
+| Cont | ContT | `(a -> r) -> r` | `(a -> m r) -> m r` |
+| IO | **DOESNT EXIST** | `IO a` | - |
+
+### Comparison of Transformers and Old Types
+
+##### Старый подход (конкретные монады)
 ```haskell
 -- Каждая комбинация эффектов требует новой монады
 data AppState = AppState { counter :: Int, log :: [String] }
@@ -1660,7 +1730,7 @@ newtype MyMonad a = MyMonad { runMyMonad :: AppState -> (a, AppState, [String]) 
 -- Проблема: для добавления Maybe эффекта нужно переписать всё
 ```
 
-### Трансформерный подход
+##### Трансформерный подход
 ```haskell
 -- Композиция через трансформеры
 type App = ReaderT Config (StateT AppState (WriterT [String] IO))
@@ -1675,7 +1745,7 @@ type AppWithError = ReaderT Config (StateT AppState (ExceptT String (WriterT [St
 - Гибкость в построении стека
 - Стандартные реализации
 
-## MonadThrow Type Class
+### MonadThrow Type Class
 
 **`MonadThrow`** — для монад, которые могут бросать исключения.
 
@@ -1698,7 +1768,7 @@ loadConfig path = do
         else throwM FileNotFound
 ```
 
-## MonadError Type Class
+### MonadError Type Class
 
 **`MonadError`** — более мощная версия `MonadThrow` с возможностью перехвата ошибок.
 
@@ -1726,7 +1796,7 @@ calculator = do
     return result
 ```
 
-## mtl Style of Transformation
+### mtl Style of Transformation
 
 **mtl (Monad Transformer Library) стиль** — использование классов типов вместо конкретных трансформеров для повышения гибкости кода.
 
@@ -1748,7 +1818,7 @@ complicatedFunction = do
 -- который предоставляет необходимые эффекты
 ```
 
-### Полный пример mtl стиля:
+##### Полный пример mtl стиля:
 
 ```haskell
 {-# LANGUAGE FlexibleContexts #-}
@@ -1791,13 +1861,13 @@ runApp2 app config = runReaderT app config
 -- Для App2 нужно адаптировать состояние, но сама логика функции не меняется!
 ```
 
-### Преимущества mtl стиля:
+##### Преимущества mtl стиля:
 - **Полиморфизм**: код работает с любым подходящим стеком
 - **Тестируемость**: легко подменить реализацию для тестов
 - **Гибкость**: можно менять стек без переписывания бизнес-логики
 - **Композиция**: функции легко комбинируются
 
-### Замечание:
+##### Замечание:
 В вопросе упоминались `MaybeIO` и `CoroutineT` — это либо опечатки, либо нестандартные трансформеры. Вероятно, имелись в виду:
 - `MaybeT` (трансформер для Maybe)
 - `ContT` (трансформер для продолжений) или другие специализированные трансформеры
