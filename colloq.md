@@ -916,11 +916,53 @@ Lecture5.hs:78:16: error:
 **Monad** - container for sequentially composable computation.
 Monad is a general way to describe idea of computations where you can combine computations in a such way so that next computation depends on result of previous computation.
 
-- Типкласс:
-  ```haskell
-  class Applicative m => Monad m where
-    (>>=) :: m a -> (a -> m b) -> m b
-  ```
+##### Type-class
+```haskell
+class Monad m where   -- m :: * -> *
+    return :: a -> m a -- помещает чистое значение в минимальный контекст монады
+    (>>=)  :: m a -> (a -> m b) -> m b  -- применяет маппер к чистому значению (маппер возвращает значение в контексте монады)
+```
+
+![monad flow](https://i.ibb.co/C3VFqQ8H/image.png)
+
+##### Importance example
+```haskell
+-- Без монад: вложенные case выражения
+processData :: String -> Maybe Result
+processData input = 
+    case parseInput input of
+        Nothing -> Nothing
+        Just x -> case validate x of
+            Nothing -> Nothing
+            Just y -> case transform y of
+                Nothing -> Nothing
+                Just z -> Just (finalize z)
+
+-- С монадами: линейный код (Do-нотация)
+processData :: String -> Maybe Result
+processData input = do
+    x <- parseInput input -- продолжаем вычисления внутри контекста монады
+    y <- validate x -- аналогией в Java будет работа с Optional::map
+    z <- transform y
+    return (finalize z)
+```
+
+##### Do-нотация
+```haskell
+-- Do-нотация
+read12AndNew' = do
+  post1 <- readPost' 1 -- читаем в переменную
+  newPost' (Post "Bla" "<text>") -- создаем 2ой пост
+  post2 <- readPost' 2 -- читаем второй пост
+  return (post1, post2)
+
+-- Раскрывается в:
+read12AndNew' = 
+  (readPost' 1) >>= \post1 -> -- это вложенные лямбды, которые делают то же, что в do-нотации
+  (newPost' (Post "Bla" "<text>")) >>= \_ ->
+  (readPost' 2) >>= \post2 ->
+  return (post1, post2)
+```
 
 ### Monad Laws
 1. **Left identity**: `return a >>= f ≡ f a`
@@ -928,22 +970,110 @@ Monad is a general way to describe idea of computations where you can combine co
 3. **Associativity**: `(m >>= f) >>= g ≡ m >>= (\x -> f x >>= g)`
 
 ### State Monad
+Используется для работы с состоянием. В примере выше `BlogM` как раз монада состояния.
 ```haskell
+-- record syntax, it's just wrapper for (s -> (a, s))
 newtype State s a = State { runState :: s -> (a, s) }
+
+instance Monad (State s) where
+    return :: a -> State s a
+    return a = State $ \s -> (a, s) -- pass lambda to constructor
+
+    (>>=) :: State s a -> (a -> State s b) -> State s b
+    oldState >>= f = State $ \s0 ->
+    let (a, s1) = runState oldState s0  -- Выполняем первое вычисление
+        newState = f a                  -- Применяем функцию к результату
+    in runState newState s1             -- Выполняем второе вычисление
 ```
-- Для управления изменяемым состоянием.
+
+![state monad](https://i.ibb.co/qbKKzV9/image.png)
 
 ### Reader Monad
+Чтобы у функций был доступ к переменным окружения (глобальным константам и т п) используется `Reader Monad`.
+
+Reader monad instance basically just passes (propagates) immutable environment to each function implicitly (automatically).
+
 ```haskell
-newtype Reader r a = Reader { runReader :: r -> a }
+-- `Reader e a` - это просто вычисление, принимающее окружение типа `e` и производящее результат типа `a`
+-- runReader :: Reader e a -> (e -> a)
+newtype Reader e a = Reader { runReader :: e -> a }
+
+instance Monad (Reader e) where
+    return :: a -> Reader e a
+    return a = Reader $ \_ -> a
+
+    (>>=) :: Reader e a -> (a -> Reader e b) -> Reader e b
+    m >>= f = Reader $ \r -> runReader (f $ runReader m r) r
+
+-- usage
+ask   :: Reader e e                            -- get whole env
+asks  :: (e -> a) -> Reader e a                -- get part of env
+local :: (e -> b) -> Reader b a -> Reader e a  -- change env locally
 ```
-- Для доступа к конфигурации.
+
+##### Why Reader?
+It is the most important monad in real life!
+
+1. You don't need to pass configs and parameters explicitly.
+
+2. You can't accidentally change environment because you don't have direct access to it.
+
+3. Your implementations can be polymorphic and can work with different parts of config.
+
+ 
 
 ### Maybe Monad
-- Обработка отсутствующих значений (null-safety).
+```haskell
+data Maybe a = Nothing | Just a
+
+instance Monad Maybe where
+    return :: a -> Maybe a
+    return = Just
+  
+    (>>=) :: Maybe a -> (a -> Maybe b) -> Maybe b
+    Nothing >>= _ = Nothing
+    Just a  >>= f = f a
+```
 
 ### Either Monad
-- Обработка ошибок с информацией.
+```haskell
+data Either e a = Left e | Right a
+
+instance Monad (Either e) where ...  -- Either a :: * -> *
+    return :: a -> Either e a
+    return = Right
+
+    (>>=) :: Either e a -> (a -> Either e b) -> Either e b
+    Left e  >>= _ = Left e
+    Right a >>= f = f a
+```
+
+### Monad composition
+```haskell
+(.)   ::            (b ->   c) -> (a ->   b) -> a ->   c
+(<=<) :: Monad m => (b -> m c) -> (a -> m b) -> a -> m c
+(>=>) :: Monad m => (a -> m b) -> (b -> m c) -> a -> m c
+
+-- definition
+m >>= (f >=> g) ≡ m >>= f >>= g
+m >>= (f <=< g) ≡ m >>= g >>= f
+
+-- laws
+(f >=> g) >=> h ≡ f >=> (g >=> h) -- associativity
+
+-- examples:
+stripUsername  :: String -> Maybe String
+validateLength :: Int -> String -> Maybe String
+
+mkUser :: String -> Maybe Username
+mkUser name = stripUsername name >>= validateLength 15 >>= Just . Username
+-- doing the same
+mkUser      = stripUsername      >=> validateLength 15 >=> Just . Username
+
+```
+
+### Monad laws
+![monad laws](https://i.ibb.co/hFjVGHcD/image.png)
 
 ---
 
