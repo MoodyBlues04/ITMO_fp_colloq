@@ -1178,92 +1178,352 @@ foldr (+) 0 [1,2,3] ≡ 1 + foldr (+) 0 [2,3]           -- using (2)
 ## Lecture 6: RealWorld
 
 ### IO Monad
-- Монада для взаимодействия с внешним миром.
 
-### do-notation
-Синтаксический сахар для цепочек монадических вычислений:
+Как мы можем реализовать последовательное чтение на haskell?
 ```haskell
-main = do
-  name <- getLine
-  putStrLn $ "Hello, " ++ name
+getchar :: Int -> (Char, Int)
+get2chars i = [a,b] where (a,i1) = getchar i
+                          (b,i2) = getchar i1
+
+
+```
+Мы можем использовать такой подход для чтения пользовательского ввода:
+```haskell
+getChar :: RealWorld -> (Char, RealWorld)
+
+main :: RealWorld -> ((), RealWorld)
+main world0 = 
+    let (a, world1) = getChar world0
+        (b, world2) = getChar world1
+    in ((), world2)
 ```
 
-### Расширения
-- `ApplicativeDo`: Оптимизация для аппликативных вычислений.
-- `RebindableSyntax`: Использовать пользовательские `>>=`, `return`.
+С `IO` монадой:
+```haskell
+type IO a  =  RealWorld -> (a, RealWorld)
+
+main :: RealWorld -> ((), RealWorld)
+main :: IO ()
+```
+
+##### Реализация IO монады
+```haskell
+data State# s -- `#` указывает на нетипизированное представление (unboxed type)
+data RealWorld -- символический "реальный мир", В runtime не существует реального значения этого типа
+
+newtype IO a = IO {unIO :: State# RealWorld -> (State# RealWorld, a)}
+
+instance Monad IO where
+  return x = IO (\s -> (s, x))
+
+-- Что делает:
+--     m s - выполняет первое IO-действие с начальным состоянием s
+--     Получает (new_s, a) - новое состояние и результат
+--     k a - применяет функцию к результату, получая новое IO-действие
+--     unIO (k a) - извлекает функцию из IO-обертки
+--     Выполняет новое действие с состоянием new_s
+  
+  IO m >>= k = IO $ \ s -> 
+     case m s of 
+       (new_s, a) -> unIO (k a) new_s
+```
+### do-notation
+Синтаксический сахар для цепочек монадических вычислений. Бало разобрано выше.
+
+##### Удобный способ последовательного исполнения
+```haskell
+-- we want to execute sequence of actions
+ioActions :: [IO ()]
+ioActions = [ print "Hello!"
+            , putStr "just kidding"
+            , getChar >> return ()
+            ]
+
+-- implementation
+sequence_ :: [IO a] -> IO ()
+sequence_ :: [IO a] -> IO ()
+sequence_ []     = return ()
+sequence_ (x:xs) = do x
+                      sequence_ xs
+
+-- usage
+main = sequence_ ioActions
+```
+
+> GHCi = infinite do-block inside IO
+
+##### let inside do
+
+```haskell
+-- let inside do example
+main :: IO ()
+main = do
+    s <- getLine
+    let rs = reverse s -- it explains why we can use let with such syntax in ghci
+    putStrLn $ "Reversed input : " ++ rs
+
+-- it is the same as:
+main :: IO ()
+main =     getLine >>= \s -> 
+           let rs = reverse s in
+           putStrLn $ "Reversed input : " ++ rs
+
+-- ! Common errors !
+let s = getLine  -- !!! Doesn't read from console to `s`
+rs <- reverse s  -- !!! `reverse s` is not a monadic action inside IO
+```
 
 ### Lazy I/O
-- Чтение данных по требованию (может вызывать проблемы с ресурсами).
+Чтение данных происходит лениво, что может вызывать проблемы и конфликты чтения-записи.
+```haskell
+-- The 'readFile' function reads a file and
+-- returns the contents of the file as a string.
+-- The file is read lazily, on demand, as with 'getContents'.
+
+readFile        :: FilePath -> IO String
+readFile name   =  openFile name ReadMode >>= hGetContents
+```
+##### Common problems
+```haskell
+main = do
+  fileContent <- readFile "foo.txt"
+  writeFile "foo.txt" ('a':fileContent)
+  readFile  "foo.txt" >>= putStrLn -- but here file is still locked
+
+-- causes error:
+ghci> :run main
+*** Exception: foo.txt: openFile: resource busy (file is locked)
+
+-- solution:
+main = do
+  fileContent <- readFile "foo.txt"
+  putStrLn fileContent
+  writeFile "foo.txt" ('a':fileContent)
+```
 
 ### FFI (Foreign Function Interface)
-- Вызов функций из C и других языков.
+В haskell возможно вызывать функции других языков:
+
+**C:**
+```C
+/* clang -c simple.c -o simple.o */
+
+int example(int a, int b)
+{
+  return a + b;
+}
+```
+**Haskell:**
+```haskell
+-- ghc simple.o simple_ffi.hs -o simple_ffi
+
+{-# LANGUAGE ForeignFunctionInterface #-}
+
+import Foreign.C.Types
+
+foreign import ccall safe "example" 
+    example :: CInt -> CInt -> CInt
+
+main = print (example 42 27)
+```
 
 ### Mutable Data
-- **IORef**: Изменяемые ссылки.
-- **IOArray**: Изменяемые массивы.
+Мутабельность существует только внутри `IO` монады.
+
+Примеры мутабельных типов:
+
+- **IORef:**
+```haskell
+-- Упрощенное определение:
+newtype IORef a = IORef (MutableByteArray# RealWorld)
+
+-- Основные операции:
+newIORef    :: a -> IO (IORef a)      -- Создать новую ссылку
+readIORef   :: IORef a -> IO a        -- Прочитать значение
+writeIORef  :: IORef a -> a -> IO ()  -- Записать новое значение
+modifyIORef :: IORef a -> (a -> a) -> IO ()  -- Модифицировать значение
+
+
+-- Usage:
+import Data.IORef (newIORef, readIORef, writeIORef)
+
+foo :: IO ()
+foo = do 
+    varA <- newIORef 0 
+    a0   <- readIORef varA
+    writeIORef varA 1
+    a1   <- readIORef varA
+    print (a0, a1)
+```
+
+- **IOArray:**
+```haskell
+-- Упрощенное определение
+data IOArray i e  -- i - тип индекса, e - тип элементов
+
+-- Основные операции:
+newArray  :: (i, i) -> e -> IO (IOArray i e)  -- Создать новый массив
+readArray :: IOArray i e -> i -> IO e         -- Прочитать элемент
+writeArray :: IOArray i e -> i -> e -> IO ()  -- Записать элемент
+
+
+-- Usage:
+import Data.Array.IO (IOArray, newArray, readArray, writeArray)
+
+bar :: IO ()
+bar = do
+    -- Создаем массив размером 1-10, заполненный числом 3
+    arr <- newArray (1,10) 37 :: IO (IOArray Int Int)
+    -- Чтение по индексу 1
+    a   <- readArray arr 1
+    -- Запись по индексу 1
+    writeArray arr 1 64
+    b   <- readArray arr 1
+    print (a, b)
+```
+> IOArray is very simple but no so very fast. Use vector package for fast both mutable and immutable arrays.
 
 ### Exceptions
-- `catch`, `throwIO`, `bracket` (безопасное приобретение/освобождение ресурсов).
+- `catch`
+- `throwIO`
+- `bracket`
 
+**throwIO:**
+```haskell
+-- definition
+throwIO :: Exception e => e -> IO a
+
+-- usage
+import Control.Exception (ArithException (..), catch, throwIO)
+import Control.Monad     (when)
+
+readAndDivide :: IO Int
+readAndDivide = do
+    x <- readLn
+    y <- readLn
+    when (y == 0) $ throwIO DivideByZero
+    return $ x `div` y
+
+
+-- Example:
+ghci> readAndDivide 
+7
+3
+2
+ghci> readAndDivide 
+3
+0
+*** Exception: divide by zero
+```
+
+**catch:**
+```haskell
+-- definition
+-- arg1 `IO a` - вычисление, которое может бросить исключение
+-- arg2 `(e -> IO a)` - функция-обработчик, которая ловит исключение и возвращает вычисление
+catch :: Exception e => IO a -> (e -> IO a) -> IO a
+
+-- usage
+safeReadAndDivide :: IO Int
+safeReadAndDivide = readAndDivide `catch` (\DivideByZero -> return (-1)) -- здесь `\DivideByZero -> return (-1)` - функция обработчик
+```
+
+##### Custom exceptions
+```haskell
+{-# LANGUAGE DeriveAnyClass     #-}
+{-# LANGUAGE DeriveDataTypeable #-}
+
+import           Control.Exception (Exception)
+import           Data.Typeable     (Typeable)
+
+data MyException = DummyException
+    deriving (Show, Typeable, Exception)
+```
+
+##### Methods
+```haskell
+try     :: Exception e => IO a -> IO (Either e a)
+tryJust :: Exception e => (e -> Maybe b) -> IO a -> IO (Either b a)
+
+finally :: IO a	 -- computation to run first
+        -> IO b	 -- computation to run afterward (even if an exception was raised)
+        -> IO a
+
+-- | Like 'finally', but only performs the final action 
+-- if there was an exception raised by the computation.
+onException :: IO a -> IO b -> IO a
+```
+
+### Guards offtop
+```haskell
+strangeOperation :: [Int] -> Ordering
+strangeOperation xs 
+   | 7  <- sum xs          -- Условие: если sum xs равно 7
+   , n  <- length xs       -- Привязка: n = length xs
+   , n  >= 5               -- Условие: n >= 5
+   , n  <= 20              -- Условие: n <= 20
+   = EQ                    -- Тогда Результат: EQ. Сработает, если Сумма элементов равна 7 && Длина списка между 5 и 20 включительно
+   
+   | otherwise             -- Все остальные случаи
+   = [3,1,2] `compare` xs  -- Результат: сравнение списков
+```
 ### unsafePerformIO
-- Небезопасное выполнение IO в чистом коде (только для экспертов).
+```haskell
+import System.IO.Unsafe
+
+foo :: ()
+foo = unsafePerformIO $ putStrLn "foo"
+
+bar :: String
+bar = unsafePerformIO $ do
+          putStrLn "bar"
+          return "baz"
+
+main = do let f = foo
+          putStrLn bar
+```
+**Проблемы:**
+- `foo` и `bar` объявлены как чистые функции, но выполняют `IO` операции - плохо, код который их использует при повторном запуске может получить другой результат
+- не ясно какой порядок выполнения будет в `main` (что первее напечатается)
+- общая проблемы с `unsafe io` в том, что возможный порядок исполнения может изменить результат программы (вывод в данном случае), что противоречит концепциям Haskell.
+
+**What to do?**
++ Whenever possible, avoid using unsafe functions.
++ If you aren't in the IO monad at all, or it's acceptable if the action is performed before other IO actions, use unsafePerformIO. (For example for logging)
 
 ### Efficient String Representations
 - **Text**: Unicode строки.
+```haskell
+{-# LANGUAGE OverloadedStrings #-}
+
+import qualified Data.Text as T
+
+-- From pack
+myTStr1 :: T.Text
+myTStr1 = T.pack ("foo" :: String)
+
+-- From overloaded string literal.
+myTStr2 :: T.Text
+myTStr2 = "bar"
+```
+
 - **ByteString**: Бинарные данные.
+```haskell
+{-# LANGUAGE OverloadedStrings #-}
 
+import qualified Data.ByteString       as S
+import qualified Data.ByteString.Char8 as S8
+
+-- From pack
+bstr1 :: S.ByteString
+bstr1 = S.pack ("foo" :: String)
+
+-- From overloaded string literal.
+bstr2 :: S8.ByteString
+bstr2 = "bar"
+```
 ---
 
-## Lecture 7: Monad Transformers
-
-### Monads as Effects
-- Каждая монада добавляет свой эффект (State, Reader, Exception).
-
-### Composing Monads
-- **Трансформеры** позволяют комбинировать монады.
-
-### MonadIO
-- Класс для поднятия IO в другие монады:
-  ```haskell
-  class MonadIO m where
-    liftIO :: IO a -> m a
-  ```
-
-### MonadTrans
-- Класс для трансформеров:
-  ```haskell
-  class MonadTrans t where
-    lift :: Monad m => m a -> t m a
-  ```
-
-### MaybeT Transformer
-```haskell
-newtype MaybeT m a = MaybeT { runMaybeT :: m (Maybe a) }
-```
-
-### ReaderT Transformer
-```haskell
-newtype ReaderT r m a = ReaderT { runReaderT :: r -> m a }
-```
-
-### Сравнение Transformers vs Old Types
-- Трансформеры композируемы, "старые" монады (как `State`) — нет.
-
-### MonadThrow / MonadError
-- Абстракции для обработки ошибок.
-
-### mtl Style
-- Использование классов типов (как `MonadReader`) для избежания явных `lift`.
-```haskell
-foo :: MonadReader Config m => m String
-```
-
-
-
-
-
----
-# ! это уже не коллок !
 # Lecture 7: Monad Transformers
 
 ## Monads as Effects
