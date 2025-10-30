@@ -891,6 +891,7 @@ prepend2 x xs = pair ++ xs
 ---
 
 ## Lecture 5: Monads
+> merged content from 2019, 2022 part1, 2022 part2
 
 ### Typed Holes
 - `_` слева от равенства - если при паттерн-матчинге подойдет любой вариант
@@ -971,6 +972,7 @@ read12AndNew' =
 
 ### State Monad
 Используется для работы с состоянием. В примере выше `BlogM` как раз монада состояния.
+
 ```haskell
 -- record syntax, it's just wrapper for (s -> (a, s))
 newtype State s a = State { runState :: s -> (a, s) }
@@ -987,6 +989,9 @@ instance Monad (State s) where
 ```
 
 ![state monad](https://i.ibb.co/qbKKzV9/image.png)
+
+##### Зачем это нужно?
+Haskell является чисто функциональным: функция, при одном и том же входе, всегда возвращает один и тот же выход. Другими словами, чистая функция не может хранить внутреннее состояние. Однако многие алгоритмы вполне естественно выражаются в состояниивой манере, например, быстрая сортировка; как мы можем реализовать их в Haskell? Простой способ представить вычисление с состоянием - это чистая функция, которая принимает начальное состояние в качестве аргумента и возвращает результат вместе с конечным состоянием. Тип State описывает такие функции.
 
 ### Reader Monad
 Чтобы у функций был доступ к переменным окружения (глобальным константам и т п) используется `Reader Monad`.
@@ -1020,7 +1025,19 @@ It is the most important monad in real life!
 
 3. Your implementations can be polymorphic and can work with different parts of config.
 
- 
+### Writer Monad
+```haskell
+-- Logger
+newtype Writer w a = Writer { runWriter :: (a, w) } -- a is value, w is log
+
+instance Monoid w => Monad (Writer w) where
+    return :: a -> Writer w a
+    return a = Writer (a, mempty)
+    
+    (>>=) :: Writer w a -> (a -> Writer w b) -> Writer w b
+    Writer (a, oldLog) >>= f = let Writer (b, newLog) = f a 
+                               in Writer (b, oldLog <> newLog)
+```
 
 ### Maybe Monad
 ```haskell
@@ -1048,15 +1065,44 @@ instance Monad (Either e) where ...  -- Either a :: * -> *
     Right a >>= f = f a
 ```
 
+### Cont Monad
+
+##### Coninuation passing style
+```haskell
+add :: Int -> Int -> Int
+add x y = x + y
+
+addCPS :: Int -> Int -> (Int -> r) -> r
+addCPS x y onDone = onDone (x + y)
+```
+Не очень понятно зачем так писать)
+
+```haskell
+newtype Cont r a = Cont { runCont :: (a -> r) -> r }
+
+instance Monad (Cont r) where
+    return :: a -> Cont r a
+    return a = Cont ($ a)
+
+    (>>=) :: Cont r a -> (a -> Cont r b) -> Cont r b
+    Cont arr >>= f = Cont $ \br -> arr $ \a -> runCont (f a) br
+
+    -- arr :: (a -> r) -> r
+    -- br  :: (b -> r)
+    -- f   :: a -> Cont r b
+```
+
 ### Monad composition
 ```haskell
 (.)   ::            (b ->   c) -> (a ->   b) -> a ->   c
 (<=<) :: Monad m => (b -> m c) -> (a -> m b) -> a -> m c
 (>=>) :: Monad m => (a -> m b) -> (b -> m c) -> a -> m c
+(>>) :: Monad m => m a -> m b -> m b -- оператор последовательного выполнения монадических действий, который игнорирует результат первого действия
 
 -- definition
 m >>= (f >=> g) ≡ m >>= f >>= g
 m >>= (f <=< g) ≡ m >>= g >>= f
+m >> k = m >>= \_ -> k
 
 -- laws
 (f >=> g) >=> h ≡ f >=> (g >=> h) -- associativity
@@ -1077,21 +1123,55 @@ mkUser      = stripUsername      >=> validateLength 15 >=> Just . Username
 
 ---
 
-## Lecture 5 2.0 Monads
+### Monads joining
+join - "раскрывает" вложенные монадические структуры.
+```haskell
+join :: Monad m => m (m a) -> m a
 
-### Parser Combinators
-- **Parser Type**: `newtype Parser a = Parser (String -> [(a, String)])`
-- **Basic Parsers**: `char`, `string`, `many`, `some`.
-- **Instances**: `Functor`, `Applicative`, `Monad`, `Alternative`.
+-- examples:
+ghci> join [[3, 4], [7, 10]] -- делает из [[a]] просто [a]
+[3, 4, 7, 10]
 
-### Property-Based Testing
-- **hspec**: Структура для модульных тестов.
-- **hedgehog**: Генерация данных и свойства.
-- **tasty**: Комбинирование тестов.
+ghci> join Just (Just 3)
+Just 3
+```
 
-### Continuations
-- **Cont**: `newtype Cont r a = Cont { runCont :: (a -> r) -> r }`
-- Монада для управления потоком выполнения.
+### Functions on monads
+```haskell
+-- Control.Monad
+liftM :: Monad m => (a -> b) -> m a -> m b
+
+-- Control.Monad.Extra
+(||^) :: Monad m => m Bool -> m Bool -> m Bool  -- lazy monadic ||
+(&&^) :: Monad m => m Bool -> m Bool -> m Bool  -- lazy monadic &&
+
+-- examples
+ghci> liftM (+1) (Just 3)
+Just 4
+ghci> liftM (+1) Nothing
+Nothing
+```
+
+### Equational reasoning
+> or Beta-reduction
+
+Это пошаговая трансормация выражения для доказательства каких-либо свойств.
+
+```haskell
+foldr :: (a -> b -> b) -> b -> [a] -> b
+foldr _ z []     =  z                   -- (1) case
+foldr f z (x:xs) =  x `f` foldr f z xs  -- (2) case
+
+-- Equational reasoning
+foldr (+) 0 [1,2,3] ≡ 1 + foldr (+) 0 [2,3]           -- using (2)
+                    ≡ 1 + (2 + foldr (+) 0 [3])       -- using (2)
+                    ≡ 1 + (2 + (3 + foldr (+) 0 []))  -- using (2)
+                    ≡ 1 + (2 + (3 + 0))               -- using (1)
+                    ≡ 1 + (2 + 3)                     -- definition of (+)
+                    ≡ 1 + 5                           -- definition of (+)
+                    ≡ 6                               -- definition of (+)
+```
+Этот способ можно использовать, например, для док-ва свойств функций (н-р `monad laws`).
 
 ---
 
